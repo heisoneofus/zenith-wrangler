@@ -39,6 +39,70 @@ def _is_numeric_dtype_name(dtype_name: str) -> bool:
     return any(token in lowered for token in ("int", "float", "double", "decimal", "number"))
 
 
+def _sanitize_dataframe_ref(reference: str, fallback: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", reference.strip()).strip("_").lower()
+    return normalized or fallback
+
+
+def _resolve_context_dataframe(
+    context: dict[str, Any],
+    dataframe_ref: str | None = None,
+    *,
+    default_to_baseline: bool = False,
+) -> pd.DataFrame:
+    raw_dataframes = context.get("dataframes")
+    if isinstance(raw_dataframes, dict):
+        dataframes = {
+            key: value
+            for key, value in raw_dataframes.items()
+            if isinstance(key, str) and isinstance(value, pd.DataFrame)
+        }
+    else:
+        dataframes: dict[str, pd.DataFrame] = {}
+    if dataframe_ref:
+        normalized_ref = _sanitize_dataframe_ref(dataframe_ref, dataframe_ref)
+        if normalized_ref not in dataframes:
+            raise ValueError(f"Dataframe reference '{normalized_ref}' is missing from context.")
+        return dataframes[normalized_ref]
+
+    if default_to_baseline:
+        baseline_ref = context.get("baseline_dataframe_ref")
+        if baseline_ref and baseline_ref in dataframes:
+            return dataframes[baseline_ref]
+
+    active_ref = context.get("active_dataframe_ref")
+    if active_ref and active_ref in dataframes:
+        return dataframes[active_ref]
+
+    fallback_dataframe = context["dataframe"] if "dataframe" in context else None
+    if isinstance(fallback_dataframe, pd.DataFrame):
+        return fallback_dataframe
+    raise ValueError("No dataframe available in context.")
+
+
+def _store_dataframe(
+    context: dict[str, Any],
+    reference: str,
+    dataframe: pd.DataFrame,
+    *,
+    set_active: bool,
+    set_baseline: bool,
+) -> None:
+    dataframes = context.setdefault("dataframes", {})
+    dataframes[reference] = dataframe
+    if set_baseline:
+        context["baseline_dataframe_ref"] = reference
+    if set_active:
+        context["active_dataframe_ref"] = reference
+        context["dataframe"] = dataframe
+
+
+def _next_derived_dataframe_ref(context: dict[str, Any], tool_name: str) -> str:
+    counter = context.get("derived_dataframe_counter", 0) + 1
+    context["derived_dataframe_counter"] = counter
+    return _sanitize_dataframe_ref(f"{tool_name}_{counter}", f"derived_{counter}")
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
@@ -130,7 +194,16 @@ class Orchestrator:
             return None
         return ToolCall(
             tool_name="aggregate_by",
-            params={"group_by": [grouping_candidates[0]], "metrics": [metric_candidates[0]], "agg": "sum"},
+            params={
+                "group_by": [grouping_candidates[0]],
+                "metrics": [metric_candidates[0]],
+                "agg": "sum",
+                "dataframe_ref": "baseline",
+                "output_dataframe_ref": _sanitize_dataframe_ref(
+                    f"aggregate_{metric_candidates[0]}_by_{grouping_candidates[0]}",
+                    "aggregate_result",
+                ),
+            },
             reasoning=f"Apply transform recommendation: {operation}",
         )
 
@@ -148,7 +221,17 @@ class Orchestrator:
             if values in analysis.data_schema:
                 return ToolCall(
                     tool_name="pivot_data",
-                    params={"index": heatmap_spec.y, "columns": heatmap_spec.x, "values": values, "aggfunc": "mean"},
+                    params={
+                        "index": heatmap_spec.y,
+                        "columns": heatmap_spec.x,
+                        "values": values,
+                        "aggfunc": "mean",
+                        "dataframe_ref": "baseline",
+                        "output_dataframe_ref": _sanitize_dataframe_ref(
+                            f"pivot_{values}_by_{heatmap_spec.y}_{heatmap_spec.x}",
+                            "pivot_result",
+                        ),
+                    },
                     reasoning=f"Apply transform recommendation: {operation}",
                 )
 
@@ -162,6 +245,11 @@ class Orchestrator:
                 "columns": grouping_candidates[1],
                 "values": metric_candidates[0],
                 "aggfunc": "mean",
+                "dataframe_ref": "baseline",
+                "output_dataframe_ref": _sanitize_dataframe_ref(
+                    f"pivot_{metric_candidates[0]}_by_{grouping_candidates[0]}_{grouping_candidates[1]}",
+                    "pivot_result",
+                ),
             },
             reasoning=f"Apply transform recommendation: {operation}",
         )
@@ -287,7 +375,13 @@ class Orchestrator:
         port: int,
         logger_ctx,
     ) -> ExecutionResult:
-        context: dict[str, Any] = {"figures": [], "transformations": []}
+        context: dict[str, Any] = {
+            "figures": [],
+            "transformations": [],
+            "dataframes": {},
+            "derived_dataframe_counter": 0,
+            "derived_dataframe_refs": [],
+        }
         output: Path | None = None
         dashboard: DashboardResult | None = None
         for index, call in enumerate(plan, start=1):
@@ -324,9 +418,25 @@ class Orchestrator:
                 raise
             for produced in tool.produces_context:
                 if produced == "dataframe":
-                    context["dataframe"] = result
-                    if tool.category in {"cleaning", "transform"}:
+                    if tool.category == "loader":
+                        _store_dataframe(context, "raw", result, set_active=True, set_baseline=False)
+                        _store_dataframe(context, "baseline", result, set_active=True, set_baseline=True)
+                    elif tool.category == "cleaning":
+                        _store_dataframe(context, "baseline", result, set_active=True, set_baseline=True)
                         context["transformations"].append(call.tool_name)
+                    elif tool.category == "transform":
+                        output_reference = validated_params.get("output_dataframe_ref")
+                        reference = (
+                            _sanitize_dataframe_ref(output_reference, call.tool_name)
+                            if output_reference
+                            else _next_derived_dataframe_ref(context, call.tool_name)
+                        )
+                        _store_dataframe(context, reference, result, set_active=True, set_baseline=False)
+                        context["derived_dataframe_refs"].append(reference)
+                        context["last_derived_dataframe_ref"] = reference
+                        context["transformations"].append(call.tool_name)
+                    else:
+                        _store_dataframe(context, "baseline", result, set_active=True, set_baseline=True)
                 elif produced == "figure":
                     context["figures"].append(result)
                 elif produced == "dashboard":
@@ -408,7 +518,7 @@ def build_registry() -> ToolRegistry:
             produces_context=("dataframe",),
             usage_guidance="Use when duplicate records affect metrics.",
             examples=[{}],
-            execute=lambda ctx: cleaning.drop_duplicates(ctx["dataframe"]),
+            execute=lambda ctx: cleaning.drop_duplicates(_resolve_context_dataframe(ctx)),
         )
     )
     registry.register(
@@ -423,7 +533,7 @@ def build_registry() -> ToolRegistry:
             usage_guidance="Prefer `auto` unless domain-specific constants are required.",
             examples=[{"strategy": "auto"}, {"strategy": "constant", "fill_value": {"region": "Unknown"}}],
             execute=lambda ctx, strategy="auto", fill_value=None: cleaning.fill_missing(
-                ctx["dataframe"], strategy=strategy, fill_value=fill_value
+                _resolve_context_dataframe(ctx), strategy=strategy, fill_value=fill_value
             ),
         )
     )
@@ -439,7 +549,7 @@ def build_registry() -> ToolRegistry:
             usage_guidance="Use on numeric fields after deciding acceptable sensitivity.",
             examples=[{"method": "iqr", "factor": 1.5}, {"columns": ["sales"], "method": "zscore", "factor": 3.0}],
             execute=lambda ctx, columns=None, factor=1.5, method="iqr": cleaning.remove_outliers(
-                ctx["dataframe"], columns=columns, factor=factor, method=method
+                _resolve_context_dataframe(ctx), columns=columns, factor=factor, method=method
             ),
         )
     )
@@ -453,9 +563,23 @@ def build_registry() -> ToolRegistry:
             requires_context=("dataframe",),
             produces_context=("dataframe",),
             usage_guidance="Use for matrix-like analysis where dimensions form rows/columns.",
-            examples=[{"index": "region", "columns": "month", "values": "sales", "aggfunc": "mean"}],
-            execute=lambda ctx, index, columns, values, aggfunc="mean": transforms.pivot_data(
-                ctx["dataframe"], index=index, columns=columns, values=values, aggfunc=aggfunc
+            examples=[
+                {"index": "region", "columns": "month", "values": "sales", "aggfunc": "mean"},
+                {
+                    "index": "region",
+                    "columns": "month",
+                    "values": "sales",
+                    "aggfunc": "mean",
+                    "dataframe_ref": "baseline",
+                    "output_dataframe_ref": "sales_matrix",
+                },
+            ],
+            execute=lambda ctx, index, columns, values, aggfunc="mean", dataframe_ref=None, output_dataframe_ref=None: transforms.pivot_data(
+                _resolve_context_dataframe(ctx, dataframe_ref=dataframe_ref),
+                index=index,
+                columns=columns,
+                values=values,
+                aggfunc=aggfunc,
             ),
         )
     )
@@ -472,9 +596,19 @@ def build_registry() -> ToolRegistry:
             examples=[
                 {"group_by": ["region"], "metrics": ["sales"], "agg": "sum"},
                 {"group_by": ["region"], "metrics": {"sales": "sum", "margin": "mean"}, "agg": "sum"},
+                {
+                    "group_by": ["region"],
+                    "metrics": ["sales"],
+                    "agg": "sum",
+                    "dataframe_ref": "baseline",
+                    "output_dataframe_ref": "sales_by_region",
+                },
             ],
-            execute=lambda ctx, group_by, metrics, agg="sum": transforms.aggregate_by(
-                ctx["dataframe"], group_by=group_by, metrics=metrics, agg=agg
+            execute=lambda ctx, group_by, metrics, agg="sum", dataframe_ref=None, output_dataframe_ref=None: transforms.aggregate_by(
+                _resolve_context_dataframe(ctx, dataframe_ref=dataframe_ref),
+                group_by=group_by,
+                metrics=metrics,
+                agg=agg,
             ),
         )
     )
@@ -488,8 +622,15 @@ def build_registry() -> ToolRegistry:
             requires_context=("dataframe",),
             produces_context=("dataframe",),
             usage_guidance="Use when columns store dictionaries or list-of-dict payloads.",
-            examples=[{"max_depth": 1}, {"max_depth": 2}],
-            execute=lambda ctx, max_depth=1: transforms.flatten_nested(ctx["dataframe"], max_depth=max_depth),
+            examples=[
+                {"max_depth": 1},
+                {"max_depth": 2},
+                {"max_depth": 2, "dataframe_ref": "baseline", "output_dataframe_ref": "flattened_events"},
+            ],
+            execute=lambda ctx, max_depth=1, dataframe_ref=None, output_dataframe_ref=None: transforms.flatten_nested(
+                _resolve_context_dataframe(ctx, dataframe_ref=dataframe_ref),
+                max_depth=max_depth,
+            ),
         )
     )
     registry.register(
@@ -501,10 +642,19 @@ def build_registry() -> ToolRegistry:
             output_kind="figure",
             requires_context=("dataframe",),
             produces_context=("figure",),
-            usage_guidance="Use after cleaning/transforms with a valid chart specification.",
-            examples=[{"spec": {"title": "Sales by Region", "chart_type": "bar", "x": "region", "y": "sales"}}],
-            execute=lambda ctx, spec: visualization.create_figure(
-                ctx["dataframe"],
+            usage_guidance=(
+                "Use after cleaning/transforms with a valid chart specification. "
+                "Defaults to the baseline cleaned dataframe unless `dataframe_ref` is provided."
+            ),
+            examples=[
+                {"spec": {"title": "Sales by Region", "chart_type": "bar", "x": "region", "y": "sales"}},
+                {
+                    "dataframe_ref": "sales_by_region",
+                    "spec": {"title": "Sales by Region", "chart_type": "bar", "x": "region", "y": "sales"},
+                },
+            ],
+            execute=lambda ctx, spec, dataframe_ref=None: visualization.create_figure(
+                _resolve_context_dataframe(ctx, dataframe_ref=dataframe_ref, default_to_baseline=True),
                 spec if isinstance(spec, VisualSpec) else VisualSpec.model_validate(spec),
             ),
         )
@@ -518,10 +668,19 @@ def build_registry() -> ToolRegistry:
             output_kind="dashboard",
             requires_context=("dataframe",),
             produces_context=("dashboard",),
-            usage_guidance="Use as the final assembly step after figure generation planning.",
-            examples=[{"design": {"title": "Sales Dashboard", "layout": "grid", "visuals": []}}],
-            execute=lambda ctx, design: build_dashboard(
-                ctx["dataframe"],
+            usage_guidance=(
+                "Use as the final assembly step after figure generation planning. "
+                "Defaults to the baseline cleaned dataframe unless `dataframe_ref` is provided."
+            ),
+            examples=[
+                {"design": {"title": "Sales Dashboard", "layout": "grid", "visuals": []}},
+                {
+                    "dataframe_ref": "sales_by_region",
+                    "design": {"title": "Regional Dashboard", "layout": "grid", "visuals": []},
+                },
+            ],
+            execute=lambda ctx, design, dataframe_ref=None: build_dashboard(
+                _resolve_context_dataframe(ctx, dataframe_ref=dataframe_ref, default_to_baseline=True),
                 design if isinstance(design, DashboardSpec) else DashboardSpec.model_validate(design),
             ),
         )

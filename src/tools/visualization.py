@@ -104,8 +104,15 @@ def _validate_spec(df: pd.DataFrame, spec: VisualSpec) -> None:
             raise ValueError(f"Column '{spec.x}' required for heatmap chart is missing from dataset.")
         if spec.y and spec.y not in df.columns:
             raise ValueError(f"Column '{spec.y}' required for heatmap chart is missing from dataset.")
-    if spec.aggregation and not (spec.x and spec.y):
-        raise ValueError("Aggregation requires both 'x' and 'y' fields.")
+    if spec.aggregation:
+        if spec.chart_type == "histogram":
+            histogram_axis = spec.x or spec.y
+            if not histogram_axis:
+                raise ValueError("Histogram aggregation requires either 'x' or 'y' field.")
+            if spec.aggregation != "count" and spec.y is None:
+                raise ValueError("Histogram aggregation requires 'y' field unless aggregation is 'count'.")
+        elif not (spec.x and spec.y):
+            raise ValueError("Aggregation requires both 'x' and 'y' fields.")
 
 
 def create_figure(df: pd.DataFrame, spec: VisualSpec):
@@ -119,7 +126,7 @@ def create_figure(df: pd.DataFrame, spec: VisualSpec):
     _validate_spec(df, spec)
     data = df
 
-    if spec.aggregation and spec.x and spec.y:
+    if spec.aggregation and spec.x and spec.y and spec.chart_type != "heatmap":
         group_keys = [spec.x]
         optional_grouping_columns = [
             column for column in _optional_encodings(spec).values() if column in df.columns
@@ -148,9 +155,31 @@ def create_figure(df: pd.DataFrame, spec: VisualSpec):
         return px.box(data, x=spec.x, y=spec.y, color=spec.color, title=spec.title)
     if chart == "heatmap":
         if spec.x and spec.y:
+            value_column = spec.color or spec.y
+            if value_column not in data.columns:
+                return error_figure(spec.title, f"Heatmap value column '{value_column}' is missing.")
+
+            aggfunc = spec.aggregation or "mean"
+            heatmap_data = data
+            if aggfunc in {"mean", "median"} and not pd.api.types.is_numeric_dtype(heatmap_data[value_column]):
+                numeric_values = pd.to_numeric(heatmap_data[value_column], errors="coerce")
+                if numeric_values.notna().sum() == 0:
+                    return error_figure(
+                        spec.title,
+                        f"No numeric value column available for heatmap aggregation '{aggfunc}'.",
+                    )
+                heatmap_data = heatmap_data.copy()
+                heatmap_data[value_column] = numeric_values
+
             pivot = pd.pivot_table(
-                data, index=spec.y, columns=spec.x, values=spec.color or spec.y, aggfunc="mean"
+                heatmap_data,
+                index=spec.y,
+                columns=spec.x,
+                values=value_column,
+                aggfunc=aggfunc,
             )
+            if pivot.empty:
+                return error_figure(spec.title, "Aggregation resulted in empty dataset.")
             return px.imshow(pivot, title=spec.title)
         return px.imshow(data.select_dtypes(include="number").corr(), title=spec.title)
     if chart == "area":
