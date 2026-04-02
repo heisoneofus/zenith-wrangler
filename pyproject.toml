@@ -1,0 +1,27 @@
+[project]
+name = "zenith-wrangler"
+version = "0.1.0"
+description = "AI-powered data dashboard generator"
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.1",
+  "dash>=2.17",
+  "dash-bootstrap-components>=1.6",
+  "loguru>=0.7",
+  "openai>=1.40",
+  "openpyxl>=3.1",
+  "pandas>=2.2",
+  "xlrd>=2.0.1",
+  "plotly>=5.22",
+  "pyarrow>=16.0",
+  "pydantic>=2.7",
+  "polars>=0.20",
+  "pyyaml>=6.0",
+  "pytest==9.0.2",
+]
+
+[project.scripts]
+zenith-wrangler = "wrangler:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
