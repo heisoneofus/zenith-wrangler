@@ -52,8 +52,8 @@ An LLM orchestrator agent with tool-calling capabilities executes:
 **Execution Flow:**
 1. Load dataset using appropriate reader
 2. Apply cleaning operations identified in Phase 1
-3. Execute transformations in dependency order
-4. Generate visualization components
+3. Execute reshaping transformations as derived dataframe artifacts (preserving a baseline cleaned dataframe)
+4. Generate visualization components against baseline or explicitly referenced derived dataframes
 5. Construct dashboard with interactivity
 6. Export final output
 
@@ -157,6 +157,11 @@ class Orchestrator:
 ```
 
 Tool calls are validated through `pydantic` input models before execution, and normalized params are logged for traceability.
+
+Orchestration context tracks dataframe lineage:
+- `baseline` dataframe: cleaned/default source for visualization and dashboard tools
+- derived dataframe references produced by reshape tools (`aggregate_by`, `pivot_data`, `flatten_nested`)
+- optional `dataframe_ref` / `output_dataframe_ref` params to route reads/writes across dataframe variants
 
 See root-level docs for discoverability and prompt/orchestration guidance:
 - `TOOLS.md` for tool semantics and failure modes

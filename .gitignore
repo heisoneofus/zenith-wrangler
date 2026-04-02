@@ -1,0 +1,10 @@
+.idea/
+.venv/
+.pytest_cache/
+__pycache__/
+logs/
+outputs/
+uv.lock
+*.csv
+.git/
+*.pyc

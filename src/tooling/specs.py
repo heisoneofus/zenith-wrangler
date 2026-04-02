@@ -81,6 +81,8 @@ class PivotDataParams(BaseModel):
     columns: str
     values: str
     aggfunc: PivotAgg = "mean"
+    dataframe_ref: str | None = Field(default=None, min_length=1)
+    output_dataframe_ref: str | None = Field(default=None, min_length=1)
 
 
 class AggregateByParams(BaseModel):
@@ -89,24 +91,30 @@ class AggregateByParams(BaseModel):
     group_by: list[str] = Field(min_length=1)
     metrics: list[str] | dict[str, str | list[str]]
     agg: str | dict[str, str] = "sum"
+    dataframe_ref: str | None = Field(default=None, min_length=1)
+    output_dataframe_ref: str | None = Field(default=None, min_length=1)
 
 
 class FlattenNestedParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_depth: int = Field(default=1, ge=0)
+    dataframe_ref: str | None = Field(default=None, min_length=1)
+    output_dataframe_ref: str | None = Field(default=None, min_length=1)
 
 
 class CreateFigureParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     spec: VisualSpec
+    dataframe_ref: str | None = Field(default=None, min_length=1)
 
 
 class BuildDashboardParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     design: DashboardSpec
+    dataframe_ref: str | None = Field(default=None, min_length=1)
 
 
 @dataclass

@@ -53,6 +53,11 @@ This means the app still decides dashboard content dynamically from the agentic 
 
 Tool orchestration now uses a schema-backed registry with `pydantic` input validation (`ToolSpec`), including machine-readable catalog export for prompt/tooling integration.
 
+Data reshaping tools now preserve dataframe lineage by default:
+- Cleaning operations maintain a `baseline` dataframe used by visualization/dashboard tools when no explicit reference is provided.
+- Reshape operations (`aggregate_by`, `pivot_data`, `flatten_nested`) produce derived dataframe references instead of replacing the baseline.
+- Tools that consume data can target a specific dataframe via `dataframe_ref`, and reshape tools can name outputs via `output_dataframe_ref`.
+
 Nested-like columns are now handled more robustly across analysis and transforms:
 - Analyzer guidance explicitly flags dict-like/list-like/JSON-like and CSV stringified nested values (for example `"['Drama', 'Crime']"` or `'{"a": 1}'`) and recommends `flatten_nested` when beneficial.
 - Orchestrator parsing maps flatten/nested/json/list-like recommendations to `flatten_nested` automatically.

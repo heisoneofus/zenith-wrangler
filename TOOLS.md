@@ -98,12 +98,14 @@ This document describes the orchestrator tool catalog used by `zenith-wrangler`.
 - **When to use:** Need row/column cross-tab style data structure.
 - **When not to use:** Data is already in desired wide format.
 - **Requires context:** `dataframe`
-- **Produces context:** `dataframe`
+- **Produces context:** `dataframe` (derived dataframe reference; does not overwrite baseline cleaned dataframe)
 - **Parameters:**
   - `index` (`str`, required): row key
   - `columns` (`str`, required): column key
   - `values` (`str`, required): values column
   - `aggfunc` (`mean|sum|median|count|min|max`, optional, default `mean`)
+  - `dataframe_ref` (`str`, optional): source dataframe reference (defaults to active dataframe)
+  - `output_dataframe_ref` (`str`, optional): name for the derived dataframe artifact
 - **Output:** pivoted dataframe
 - **Failure modes:** missing columns, non-aggregable values, invalid agg function, missing dataframe context
 - **Example call:** `{ "tool_name": "pivot_data", "params": { "index": "region", "columns": "month", "values": "sales", "aggfunc": "mean" } }`
@@ -115,11 +117,13 @@ This document describes the orchestrator tool catalog used by `zenith-wrangler`.
 - **When to use:** Need grouped totals/means/counts per dimension.
 - **When not to use:** Granular row-level detail must be preserved.
 - **Requires context:** `dataframe`
-- **Produces context:** `dataframe`
+- **Produces context:** `dataframe` (derived dataframe reference; does not overwrite baseline cleaned dataframe)
 - **Parameters:**
   - `group_by` (`list[str]`, required): grouping columns
   - `metrics` (`list[str] | dict[str, str | list[str]]`, required): metric columns or per-column aggregation map
   - `agg` (`str | dict[str, str]`, optional, default `sum`): global or per-column aggregator
+  - `dataframe_ref` (`str`, optional): source dataframe reference (defaults to active dataframe)
+  - `output_dataframe_ref` (`str`, optional): name for the derived dataframe artifact
 - **Output:** grouped dataframe
 - **Failure modes:** missing grouping/metric columns, unsupported aggregators, missing dataframe context
 - **Example call:** `{ "tool_name": "aggregate_by", "params": { "group_by": ["region"], "metrics": ["sales"], "agg": "sum" } }`
@@ -131,9 +135,11 @@ This document describes the orchestrator tool catalog used by `zenith-wrangler`.
 - **When to use:** Dataset includes JSON-like nested structures.
 - **When not to use:** Data is already flat or nesting should remain intact for downstream logic.
 - **Requires context:** `dataframe`
-- **Produces context:** `dataframe`
+- **Produces context:** `dataframe` (derived dataframe reference; does not overwrite baseline cleaned dataframe)
 - **Parameters:**
   - `max_depth` (`int`, optional, `>=0`, default `1`): flatten recursion depth
+  - `dataframe_ref` (`str`, optional): source dataframe reference (defaults to active dataframe)
+  - `output_dataframe_ref` (`str`, optional): name for the derived dataframe artifact
 - **Output:** flattened dataframe
 - **Failure modes:** malformed nested values, unsupported deep structures, missing dataframe context
 - **Example call:** `{ "tool_name": "flatten_nested", "params": { "max_depth": 2 } }`
@@ -148,6 +154,7 @@ This document describes the orchestrator tool catalog used by `zenith-wrangler`.
 - **Produces context:** `figure`
 - **Parameters:**
   - `spec` (`VisualSpec`, required): chart metadata (`title`, `chart_type`, axis fields, optional color/aggregation)
+  - `dataframe_ref` (`str`, optional): explicit dataframe reference to visualize. If omitted, tool uses baseline cleaned dataframe.
 - **Output:** Plotly figure object
 - **Failure modes:** missing required chart columns/axes, invalid chart spec, empty post-aggregation dataset
 - **Example call:** `{ "tool_name": "create_figure", "params": { "spec": { "title": "Sales by Region", "chart_type": "bar", "x": "region", "y": "sales" } } }`
@@ -162,6 +169,7 @@ This document describes the orchestrator tool catalog used by `zenith-wrangler`.
 - **Produces context:** `dashboard`
 - **Parameters:**
   - `design` (`DashboardSpec`, required): dashboard title/layout/visual/filter plan
+  - `dataframe_ref` (`str`, optional): explicit dataframe reference for dashboard/filter context. If omitted, tool uses baseline cleaned dataframe.
 - **Output:** `DashboardResult` containing Dash app + resolved spec
 - **Failure modes:** invalid visual/filter references, rendering callback errors at runtime, missing dataframe context
 - **Example call:** `{ "tool_name": "build_dashboard", "params": { "design": { "title": "Sales Dashboard", "layout": "grid", "visuals": [] } } }`
