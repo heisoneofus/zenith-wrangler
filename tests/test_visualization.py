@@ -169,6 +169,25 @@ class VisualizationTests(unittest.TestCase):
 
         self.assertGreater(len(figure.data), 0)
 
+    def test_create_figure_heatmap_count_without_color_counts_rows(self) -> None:
+        df = pd.DataFrame(
+            {
+                "day_of_week": [0, 0, 1, 1, 1],
+                "shift": ["day", "night", "day", "day", "night"],
+            }
+        )
+        spec = VisualSpec(
+            title="Demand Heatmap",
+            chart_type="heatmap",
+            x="day_of_week",
+            y="shift",
+            aggregation="count",
+        )
+
+        figure = create_figure(df, spec)
+
+        self.assertGreater(len(figure.data), 0)
+
     def test_create_figure_heatmap_with_non_numeric_values_returns_error_figure(self) -> None:
         df = pd.DataFrame(
             {

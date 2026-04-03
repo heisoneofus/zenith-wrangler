@@ -27,7 +27,20 @@ dev = [
 [project.scripts]
 zenith-wrangler = "wrangler:main"
 
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["wrangler"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.uv]
+package = true

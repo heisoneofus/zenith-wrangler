@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any
@@ -9,7 +10,7 @@ import pandas as pd
 
 from src.config import AppConfig
 from src.dashboard.builder import DashboardResult, build_dashboard
-from src.models import AnalysisReport, DashboardSpec, VisualSpec
+from src.models import AnalysisReport, DashboardSpec, ExecutionTrace, ToolEvent, VisualSpec
 from src.tooling import (
     AggregateByParams,
     BuildDashboardParams,
@@ -138,10 +139,12 @@ class ToolCall:
 @dataclass
 class ExecutionResult:
     dataframe: pd.DataFrame | None
+    baseline_dataframe: pd.DataFrame | None
     figures: list[Any]
     dashboard: DashboardResult | None
     output_path: Path | None
     transformations_applied: list[str]
+    warnings: list[str]
 
 
 class Orchestrator:
@@ -332,7 +335,12 @@ class Orchestrator:
         # If no match, skip this operation
         return None
 
-    def plan_execution(self, analysis: AnalysisReport, data_path: Path) -> list[ToolCall]:
+    def plan_execution(
+        self,
+        analysis: AnalysisReport,
+        data_path: Path,
+        design_override: DashboardSpec | None = None,
+    ) -> list[ToolCall]:
         plan: list[ToolCall] = []
         loader = loaders.detect_loader(data_path)
         plan.append(
@@ -349,8 +357,9 @@ class Orchestrator:
             if tool_call:
                 plan.append(tool_call)
 
-        safe_visuals = [self._sanitize_visual_spec(spec, analysis) for spec in analysis.design.visuals]
-        safe_design = analysis.design.model_copy(update={"visuals": safe_visuals})
+        design_source = design_override or analysis.design
+        safe_visuals = [self._sanitize_visual_spec(spec, analysis) for spec in design_source.visuals]
+        safe_design = design_source.model_copy(update={"visuals": safe_visuals})
 
         for safe_spec in safe_visuals:
             plan.append(
@@ -376,6 +385,8 @@ class Orchestrator:
         output_path: Path,
         port: int,
         logger_ctx,
+        trace: ExecutionTrace | None = None,
+        defer_export: bool = False,
     ) -> ExecutionResult:
         context: dict[str, Any] = {
             "figures": [],
@@ -383,6 +394,7 @@ class Orchestrator:
             "dataframes": {},
             "derived_dataframe_counter": 0,
             "derived_dataframe_refs": [],
+            "guardrail_warnings": [],
         }
         output: Path | None = None
         dashboard: DashboardResult | None = None
@@ -390,13 +402,50 @@ class Orchestrator:
             tool = self.registry.get(call.tool_name)
             validated_params = tool.validate_params(call.params).model_dump(mode="python", exclude_none=True)
             logger_ctx.log_tool_call(index, call.tool_name, call.reasoning, validated_params)
+            if trace is not None:
+                trace.events.append(
+                    ToolEvent(
+                        event_type="tool_call",
+                        tool_name=call.tool_name,
+                        status="planned",
+                        reasoning=call.reasoning,
+                        params=_json_safe_payload(validated_params),
+                        started_at=_utc_now(),
+                    )
+                )
+            previous_dataframe = context.get("dataframe")
             try:
                 result = tool.execute(context, **validated_params)
             except Exception as exc:
                 message = f"Pipeline step failed at '{call.tool_name}'."
                 if hasattr(logger_ctx, "log_block"):
                     logger_ctx.log_block("Execution Error", f"{message}\n{exc}")
+                if trace is not None:
+                    trace.events.append(
+                        ToolEvent(
+                            event_type="tool_result",
+                            tool_name=call.tool_name,
+                            status="failed",
+                            reasoning=call.reasoning,
+                            params=_json_safe_payload(validated_params),
+                            message=f"{message} Reason: {exc}",
+                            started_at=_utc_now(),
+                            ended_at=_utc_now(),
+                        )
+                    )
+                    trace.status = "failed"
+                    trace.warnings.append(str(exc))
                 if output_format in {"server", "dash"}:
+                    if defer_export:
+                        return ExecutionResult(
+                            dataframe=context.get("dataframe"),
+                            baseline_dataframe=self._baseline_dataframe(context),
+                            figures=context.get("figures", []),
+                            dashboard=dashboard,
+                            output_path=None,
+                            transformations_applied=context.get("transformations", []),
+                            warnings=context.get("guardrail_warnings", []),
+                        )
                     error_app = visualization.build_error_app(
                         title="Dashboard Generation Failed",
                         message="The dashboard could not be generated. Review the error details below.",
@@ -412,14 +461,40 @@ class Orchestrator:
                     )
                     return ExecutionResult(
                         dataframe=context.get("dataframe"),
+                        baseline_dataframe=self._baseline_dataframe(context),
                         figures=context.get("figures", []),
                         dashboard=dashboard,
                         output_path=output,
                         transformations_applied=context.get("transformations", []),
+                        warnings=context.get("guardrail_warnings", []),
                     )
                 raise
+            skip_storage = False
+            guardrail_warning = self._guard_destructive_transform(
+                call.tool_name,
+                previous_dataframe if isinstance(previous_dataframe, pd.DataFrame) else None,
+                result if isinstance(result, pd.DataFrame) else None,
+            )
+            if guardrail_warning:
+                skip_storage = True
+                context["guardrail_warnings"].append(guardrail_warning)
+                if trace is not None:
+                    trace.events.append(
+                        ToolEvent(
+                            event_type="warning",
+                            tool_name=call.tool_name,
+                            status="skipped",
+                            reasoning=call.reasoning,
+                            params=_json_safe_payload(validated_params),
+                            message=guardrail_warning,
+                            started_at=_utc_now(),
+                            ended_at=_utc_now(),
+                        )
+                    )
             for produced in tool.produces_context:
                 if produced == "dataframe":
+                    if skip_storage:
+                        continue
                     if tool.category == "loader":
                         _store_dataframe(context, "raw", result, set_active=True, set_baseline=False)
                         _store_dataframe(context, "baseline", result, set_active=True, set_baseline=True)
@@ -444,9 +519,32 @@ class Orchestrator:
                 elif produced == "dashboard":
                     dashboard = result
                     context["dashboard"] = result
+            if trace is not None and not skip_storage:
+                trace.events.append(
+                    ToolEvent(
+                        event_type="tool_result",
+                        tool_name=call.tool_name,
+                        status="completed",
+                        reasoning=call.reasoning,
+                        params=_json_safe_payload(validated_params),
+                        outputs=self._summarize_result(call.tool_name, result),
+                        started_at=_utc_now(),
+                        ended_at=_utc_now(),
+                    )
+                )
 
         figures = context.get("figures", [])
         dashboard = dashboard or context.get("dashboard")
+        if defer_export:
+            return ExecutionResult(
+                dataframe=context.get("dataframe"),
+                baseline_dataframe=self._baseline_dataframe(context),
+                figures=figures,
+                dashboard=dashboard,
+                output_path=None,
+                transformations_applied=context.get("transformations", []),
+                warnings=context.get("guardrail_warnings", []),
+            )
         output = visualization.export_dashboard(
             output_format=output_format,
             output_path=output_path,
@@ -457,11 +555,61 @@ class Orchestrator:
         )
         return ExecutionResult(
             dataframe=context.get("dataframe"),
+            baseline_dataframe=self._baseline_dataframe(context),
             figures=figures,
             dashboard=dashboard,
             output_path=output,
             transformations_applied=context.get("transformations", []),
+            warnings=context.get("guardrail_warnings", []),
         )
+
+    def _summarize_result(self, tool_name: str, result: Any) -> dict[str, Any]:
+        if isinstance(result, pd.DataFrame):
+            return {
+                "rows": len(result),
+                "columns": list(result.columns),
+            }
+        title = getattr(getattr(result, "layout", None), "title", None)
+        if title is not None and hasattr(title, "text"):
+            return {"figure_title": title.text or tool_name}
+        dashboard_spec = getattr(result, "spec", None)
+        if dashboard_spec is not None:
+            return {
+                "dashboard_title": dashboard_spec.title,
+                "visual_count": len(dashboard_spec.visuals),
+            }
+        return {"result_type": type(result).__name__}
+
+    def _guard_destructive_transform(
+        self,
+        tool_name: str,
+        previous_dataframe: pd.DataFrame | None,
+        result_dataframe: pd.DataFrame | None,
+    ) -> str | None:
+        if tool_name not in {"remove_outliers", "drop_duplicates"}:
+            return None
+        if previous_dataframe is None or result_dataframe is None or previous_dataframe.empty:
+            return None
+        removed_rows = len(previous_dataframe) - len(result_dataframe)
+        if removed_rows <= 0:
+            return None
+        removed_ratio = removed_rows / max(len(previous_dataframe), 1)
+        if removed_ratio < 0.35:
+            return None
+        return (
+            f"Skipped `{tool_name}` because it removed {removed_rows} rows "
+            f"({removed_ratio:.0%} of the current dataset), exceeding the analyst safety threshold."
+        )
+
+    def _baseline_dataframe(self, context: dict[str, Any]) -> pd.DataFrame | None:
+        baseline_ref = context.get("baseline_dataframe_ref")
+        dataframes = context.get("dataframes", {})
+        if isinstance(baseline_ref, str) and isinstance(dataframes, dict):
+            baseline = dataframes.get(baseline_ref)
+            if isinstance(baseline, pd.DataFrame):
+                return baseline
+        dataframe = context.get("dataframe")
+        return dataframe if isinstance(dataframe, pd.DataFrame) else None
 
 
 def build_registry() -> ToolRegistry:
@@ -692,3 +840,21 @@ def build_registry() -> ToolRegistry:
 
 def export_tool_catalog() -> list[dict[str, Any]]:
     return build_registry().export_tool_catalog()
+
+
+def _json_safe_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, Path):
+            safe[key] = str(value)
+        elif isinstance(value, dict):
+            safe[key] = _json_safe_payload(value)
+        elif isinstance(value, list):
+            safe[key] = [str(item) if isinstance(item, Path) else item for item in value]
+        else:
+            safe[key] = value
+    return safe
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()

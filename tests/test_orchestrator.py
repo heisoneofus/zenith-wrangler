@@ -380,6 +380,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("aggregate_by", result.transformations_applied)
         self.assertIn("pivot_data", result.transformations_applied)
         self.assertIsNotNone(result.dataframe)
+        self.assertIsNotNone(result.baseline_dataframe)
+        self.assertIn("sleep_quality_score", result.baseline_dataframe.columns)
         self.assertIn("occupation", result.dataframe.columns)
         self.assertIn("Morning", result.dataframe.columns)
 
@@ -434,6 +436,52 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(result.figures), 0)
         app_mock.assert_called_once()
         export_mock.assert_called_once()
+
+    def test_execute_plan_skips_destructive_cleaning_when_row_loss_is_high(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="read_csv",
+                description="Read data",
+                category="loader",
+                input_model=_ReadCsvParams,
+                output_kind="dataframe",
+                produces_context=("dataframe",),
+                execute=lambda ctx, path, sample_rows=None: pd.DataFrame({"value": list(range(10))}),
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="remove_outliers",
+                description="Remove outliers",
+                category="cleaning",
+                input_model=_NoParams,
+                output_kind="dataframe",
+                requires_context=("dataframe",),
+                produces_context=("dataframe",),
+                execute=lambda ctx: pd.DataFrame({"value": [1, 2, 3]}),
+            )
+        )
+
+        plan = [
+            ToolCall(tool_name="read_csv", params={"path": "dataset.csv"}, reasoning="load"),
+            ToolCall(tool_name="remove_outliers", params={}, reasoning="clean"),
+        ]
+        orchestrator = Orchestrator(AppConfig.default(Path.cwd()), registry)
+        logger_ctx = _DummyLogger()
+
+        result = orchestrator.execute_plan(
+            plan=plan,
+            output_format="html",
+            output_path=Path("outputs/dashboard_test.html"),
+            port=8050,
+            logger_ctx=logger_ctx,
+            defer_export=True,
+        )
+
+        self.assertEqual(len(result.dataframe), 10)
+        self.assertTrue(result.warnings)
+        self.assertEqual(result.transformations_applied, [])
 
 
 if __name__ == "__main__":

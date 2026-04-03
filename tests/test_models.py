@@ -9,6 +9,8 @@ from src.models import (
     DashboardSpec,
     DataQualityAssessment,
     MetricsAnalysis,
+    SessionState,
+    VisualSpec,
 )
 
 
@@ -48,6 +50,21 @@ class AnalysisReportModelTests(unittest.TestCase):
         self.assertSetEqual(required, properties)
         self.assertIn("data_schema", properties)
         self.assertNotIn("schema", properties)
+
+    def test_visual_spec_includes_agentic_provenance_defaults(self) -> None:
+        visual = VisualSpec(title="Sales", chart_type="bar")
+
+        self.assertTrue(visual.id.startswith("visual_"))
+        self.assertEqual(visual.rationale, "")
+        self.assertEqual(visual.warnings, [])
+        self.assertEqual(visual.status, "proposed")
+
+    def test_session_state_tracks_spec_versions(self) -> None:
+        spec = DashboardSpec(title="Demo")
+        state = SessionState(session_id="session_1", active_spec=spec, spec_versions=[spec])
+
+        self.assertEqual(state.active_spec.title, "Demo")
+        self.assertEqual(len(state.spec_versions), 1)
 
 
 if __name__ == "__main__":

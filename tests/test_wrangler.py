@@ -81,6 +81,20 @@ class ToolCatalogExportTests(unittest.TestCase):
             self.assertIn("tools", payload)
             self.assertTrue(any(tool.get("name") == "read_csv" for tool in payload["tools"]))
 
+    def test_cli_review_only_writes_session_state_artifacts(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = Path(tmp) / "sample.csv"
+            data_path.write_text("region,sales\nEU,10\nUS,20\n", encoding="utf-8")
+            before = {path.name for path in Path("logs").glob("session_*.state.json")}
+
+            result = runner.invoke(main, ["--data", str(data_path), "--review-only", "--output-format", "html"])
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Plan proposal written to:", result.output)
+            after = {path.name for path in Path("logs").glob("session_*.state.json")}
+            self.assertGreater(len(after - before), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

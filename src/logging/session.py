@@ -8,9 +8,13 @@ from typing import Any
 
 from loguru import logger
 
+from src.models import ExecutionTrace, SessionState
+
 
 SPEC_START = "BEGIN_DASHBOARD_SPEC"
 SPEC_END = "END_DASHBOARD_SPEC"
+STATE_SUFFIX = ".state.json"
+TRACE_SUFFIX = ".trace.json"
 
 
 def _json_default(value: Any) -> Any:
@@ -69,6 +73,25 @@ class SessionLogger:
         self.write_line(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
         self.write_line(SPEC_END)
 
+    def artifact_path(self, suffix: str) -> Path:
+        stem = self.path.stem
+        return self.path.with_name(f"{stem}{suffix}")
+
+    def write_artifact(self, suffix: str, payload: dict[str, Any]) -> Path:
+        artifact_path = self.artifact_path(suffix)
+        artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+        return artifact_path
+
+    def log_session_state(self, state: SessionState) -> Path:
+        artifact_path = self.write_artifact(STATE_SUFFIX, state.model_dump(mode="python"))
+        self.log_kv({"session_state_artifact": str(artifact_path)})
+        return artifact_path
+
+    def log_execution_trace(self, trace: ExecutionTrace) -> Path:
+        artifact_path = self.write_artifact(TRACE_SUFFIX, trace.model_dump(mode="python"))
+        self.log_kv({"execution_trace_artifact": str(artifact_path)})
+        return artifact_path
+
 
 def init_session_logger(logs_dir: Path) -> SessionLogger:
     session_id = make_session_id()
@@ -78,6 +101,12 @@ def init_session_logger(logs_dir: Path) -> SessionLogger:
 
 
 def load_dashboard_spec(session_log: Path) -> dict[str, Any]:
+    state_path = session_log.with_name(f"{session_log.stem}{STATE_SUFFIX}")
+    if state_path.exists():
+        state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+        active_spec = state_payload.get("active_spec")
+        if isinstance(active_spec, dict):
+            return active_spec
     if not session_log.exists():
         raise FileNotFoundError(f"Session log not found: {session_log}")
     content = session_log.read_text(encoding="utf-8")
@@ -101,3 +130,19 @@ def load_session_metadata(session_log: Path) -> dict[str, str]:
                 key, value = key_value[0].strip(), key_value[1].strip()
                 metadata[key] = value
     return metadata
+
+
+def load_session_state(session_log: Path) -> SessionState:
+    state_path = session_log.with_name(f"{session_log.stem}{STATE_SUFFIX}")
+    if not state_path.exists():
+        raise FileNotFoundError(f"Session state artifact not found: {state_path}")
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    return SessionState.model_validate(payload)
+
+
+def load_execution_trace(session_log: Path) -> ExecutionTrace:
+    trace_path = session_log.with_name(f"{session_log.stem}{TRACE_SUFFIX}")
+    if not trace_path.exists():
+        raise FileNotFoundError(f"Execution trace artifact not found: {trace_path}")
+    payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    return ExecutionTrace.model_validate(payload)
