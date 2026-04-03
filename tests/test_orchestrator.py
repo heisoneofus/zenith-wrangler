@@ -131,6 +131,39 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(figure_calls), 1)
         self.assertEqual(figure_calls[0].params["spec"]["y"], "amount")
 
+    def test_plan_execution_sanitizes_dashboard_design_visuals(self) -> None:
+        analysis = AnalysisReport(
+            metrics=MetricsAnalysis(
+                primary_metrics=["sales"],
+                secondary_metrics=[],
+                dimensions=["region"],
+                time_fields=[],
+                notes="",
+            ),
+            quality=DataQualityAssessment(),
+            design=DashboardSpec(
+                visuals=[
+                    VisualSpec(
+                        title="Bad Visual",
+                        chart_type="bar",
+                        x="region",
+                        y="user_id",
+                        color="user_id",
+                    )
+                ]
+            ),
+            sampled_rows=3,
+            data_schema={"region": "object", "sales": "float64", "user_id": "int64"},
+        )
+
+        orchestrator = Orchestrator(AppConfig.default(Path.cwd()), ToolRegistry())
+        plan = orchestrator.plan_execution(analysis, Path("dataset.csv"))
+        dashboard_call = next(call for call in plan if call.tool_name == "build_dashboard")
+        visual = dashboard_call.params["design"]["visuals"][0]
+
+        self.assertEqual(visual["y"], "sales")
+        self.assertIsNone(visual["color"])
+
     def test_execute_plan_tracks_transformations_and_exports(self) -> None:
         registry = ToolRegistry()
         captured_paths: list[Path] = []

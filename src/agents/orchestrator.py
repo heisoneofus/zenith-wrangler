@@ -349,8 +349,10 @@ class Orchestrator:
             if tool_call:
                 plan.append(tool_call)
 
-        for spec in analysis.design.visuals:
-            safe_spec = self._sanitize_visual_spec(spec, analysis)
+        safe_visuals = [self._sanitize_visual_spec(spec, analysis) for spec in analysis.design.visuals]
+        safe_design = analysis.design.model_copy(update={"visuals": safe_visuals})
+
+        for safe_spec in safe_visuals:
             plan.append(
                 ToolCall(
                     tool_name="create_figure",
@@ -361,7 +363,7 @@ class Orchestrator:
         plan.append(
             ToolCall(
                 tool_name="build_dashboard",
-                params={"design": analysis.design.model_dump()},
+                params={"design": safe_design.model_dump()},
                 reasoning="Assemble Dash layout and callbacks.",
             )
         )

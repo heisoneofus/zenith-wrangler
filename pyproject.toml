@@ -17,6 +17,10 @@ dependencies = [
   "pydantic>=2.7",
   "polars>=0.20",
   "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
   "pytest==9.0.2",
 ]
 
@@ -24,4 +28,6 @@ dependencies = [
 zenith-wrangler = "wrangler:main"
 
 [tool.pytest.ini_options]
+addopts = "-ra"
 pythonpath = ["."]
+testpaths = ["tests"]
