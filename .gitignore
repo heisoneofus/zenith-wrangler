@@ -1,0 +1,14 @@
+.idea/
+.pytest_cache/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+logs/
+outputs/
+
+.DS_Store
+Thumbs.db
