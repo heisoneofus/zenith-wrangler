@@ -188,6 +188,50 @@ class VisualizationTests(unittest.TestCase):
 
         self.assertGreater(len(figure.data), 0)
 
+    def test_create_figure_pie_count_uses_color_as_category_when_x_is_missing(self) -> None:
+        df = pd.DataFrame(
+            {
+                "csat_score": ["good", "bad", "good", "good"],
+                "day_of_week": [1, 1, 2, 3],
+            }
+        )
+        spec = VisualSpec(
+            title="CSAT Mix",
+            chart_type="pie",
+            color="csat_score",
+            y="day_of_week",
+            aggregation="count",
+        )
+
+        figure = create_figure(df, spec)
+
+        self.assertGreater(len(figure.data), 0)
+        self.assertEqual(set(figure.data[0].labels), {"good", "bad"})
+
+    def test_create_figure_applies_day_time_grain_before_aggregation(self) -> None:
+        df = pd.DataFrame(
+            {
+                "ticket_created_at": [
+                    "2026-04-01T08:00:00",
+                    "2026-04-01T10:30:00",
+                    "2026-04-02T09:15:00",
+                ],
+                "csat_score": [4, 5, 3],
+            }
+        )
+        spec = VisualSpec(
+            title="Daily CSAT",
+            chart_type="line",
+            x="ticket_created_at",
+            y="csat_score",
+            aggregation="mean",
+            time_grain="day",
+        )
+
+        figure = create_figure(df, spec)
+
+        self.assertEqual(len(list(figure.data[0].x)), 2)
+
     def test_create_figure_heatmap_with_non_numeric_values_returns_error_figure(self) -> None:
         df = pd.DataFrame(
             {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
 from textwrap import dedent
 from typing import Any
@@ -12,6 +13,11 @@ import dash_bootstrap_components as dbc
 
 from src.models import DashboardSpec, SessionState, VisualSpec
 from src.tools.visualization import create_figure, error_figure
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None  # type: ignore
 
 
 GRAPH_CONFIG = {
@@ -251,6 +257,17 @@ def _keyword_chart_type(prompt: str) -> str | None:
     return None
 
 
+def _prompt_time_grain(prompt: str) -> str | None:
+    lowered = prompt.lower()
+    if any(token in lowered for token in [" by day", " daily", " per day", "group by date", "group by day"]):
+        return "day"
+    if any(token in lowered for token in [" by week", " weekly", " per week", "group by week"]):
+        return "week"
+    if any(token in lowered for token in [" by month", " monthly", " per month", "group by month"]):
+        return "month"
+    return None
+
+
 def _next_chart_type(current: str) -> str:
     cycle = ["bar", "line", "scatter", "box", "histogram", "area", "pie", "heatmap"]
     if current not in cycle:
@@ -273,6 +290,7 @@ def _regenerate_visual_spec(df: pd.DataFrame, spec: VisualSpec, prompt: str) -> 
     dimension_columns = _dimension_columns(df)
     date_columns = [column for column in df.columns if _is_date_filter(df, column)]
     chart_type = _keyword_chart_type(prompt) or _next_chart_type(updated.chart_type)
+    requested_time_grain = _prompt_time_grain(prompt)
     mentioned_numeric = [column for column in matched_columns if column in numeric_columns]
     mentioned_dimensions = [column for column in matched_columns if column in dimension_columns]
 
@@ -295,9 +313,10 @@ def _regenerate_visual_spec(df: pd.DataFrame, spec: VisualSpec, prompt: str) -> 
 
     updated.chart_type = chart_type  # type: ignore[assignment]
     updated.color = None
+    updated.time_grain = requested_time_grain
 
     if chart_type in {"bar", "line", "area"}:
-        updated.x = default_dimension
+        updated.x = _first_distinct(date_columns) if requested_time_grain and date_columns else default_dimension
         updated.y = default_metric if default_metric in numeric_columns else None
         updated.aggregation = "mean" if updated.y else "count"
     elif chart_type == "scatter":
@@ -323,7 +342,7 @@ def _regenerate_visual_spec(df: pd.DataFrame, spec: VisualSpec, prompt: str) -> 
         updated.y = secondary_dimension or _first_distinct(dimension_columns, exclude={default_dimension} if default_dimension else None)
         updated.aggregation = "count"
     else:
-        updated.x = default_dimension
+        updated.x = _first_distinct(date_columns) if requested_time_grain and date_columns else default_dimension
         updated.y = default_metric if default_metric in numeric_columns else updated.y
         updated.aggregation = updated.aggregation or "mean"
 
@@ -336,6 +355,61 @@ def _regenerate_visual_spec(df: pd.DataFrame, spec: VisualSpec, prompt: str) -> 
     updated.confidence = min((updated.confidence or 0.62) + 0.04, 0.95)
     updated.status = "revised"
     return updated
+
+
+def _llm_regenerate_visual_spec(
+    df: pd.DataFrame,
+    spec: VisualSpec,
+    prompt: str,
+    llm_api_key: str | None,
+) -> VisualSpec | None:
+    api_key = llm_api_key or os.getenv("OPENAI_API_KEY")
+    if not prompt.strip() or not api_key or OpenAI is None:
+        return None
+
+    client = OpenAI(api_key=api_key)
+    schema = {column: str(dtype) for column, dtype in df.dtypes.items()}
+    request = {
+        "task": "Regenerate one dashboard visual from a user prompt.",
+        "instructions": [
+            "Return a valid VisualSpec using only columns present in the schema.",
+            "Prefer a time field on x when the user asks for timeline/date/day/week/month grouping.",
+            "Use `time_grain` when the user asks for day, week, or month grouping.",
+            "Set aggregation when grouped rollups are needed.",
+            "Do not invent fields that are not in the schema.",
+            "Keep the title concise and user-facing.",
+        ],
+        "schema": schema,
+        "current_spec": spec.model_dump(mode="python"),
+        "prompt": prompt,
+        "sample_rows": df.head(20).to_dict(orient="records"),
+    }
+    response = client.responses.parse(
+        model="gpt-5.2",
+        temperature=0.2,
+        input=json.dumps(request, default=str),
+        text_format=VisualSpec,
+    )
+    parsed = response.output_parsed
+    if isinstance(parsed, VisualSpec):
+        regenerated = parsed
+    elif parsed is not None:
+        regenerated = VisualSpec.model_validate(parsed)
+    else:
+        regenerated = VisualSpec.model_validate_json(response.output_text)
+
+    return regenerated.model_copy(
+        update={
+            "id": spec.id,
+            "pinned": spec.pinned,
+            "source_dataframe_ref": regenerated.source_dataframe_ref or spec.source_dataframe_ref or "baseline",
+            "description": regenerated.description or f"Regenerated to focus on {prompt.strip()}.",
+            "rationale": regenerated.rationale or f"Navigator regenerated this chart around '{prompt.strip()}'.",
+            "warnings": list(regenerated.warnings) + [f"Regenerated from prompt: {prompt.strip()}."],
+            "confidence": regenerated.confidence if regenerated.confidence is not None else min((spec.confidence or 0.62) + 0.08, 0.96),
+            "status": "revised",
+        }
+    )
 
 
 def _quality_rows(design: DashboardSpec, session_state: SessionState | None) -> list[dict[str, str]]:
@@ -429,11 +503,10 @@ def _build_plan_panel(design: DashboardSpec, session_state: SessionState | None,
 
 def _build_workspace_controls(spec_versions: list[DashboardSpec]) -> html.Div:
     return html.Div(
-        className="action-bar",
+        id="workspace-controls",
+        className="action-bar action-bar--review",
         children=[
             html.Button("Approve Plan", id="approve-plan", n_clicks=0, className="action-button"),
-            html.Button("Undo Revision", id="undo-revision", n_clicks=0, className="action-button"),
-            html.Button("Compare Versions", id="compare-versions", n_clicks=0, className="action-button action-button--subtle"),
             html.Button("Export Plan", id="export-plan", n_clicks=0, className="action-button action-button--subtle action-button--small"),
             html.Button(
                 "Export Provenance",
@@ -611,14 +684,26 @@ def _sidebar_panel_class(base: str, approved: bool) -> str:
     return f"{base} sidebar-card sidebar-card--hidden" if approved else f"{base} sidebar-card"
 
 
-def _visual_rail_class(approved: bool, visual_count: int) -> str:
+def _filter_panel_class(approved: bool) -> str:
+    return "panel-card filter-panel filter-panel--compact" if approved else "panel-card filter-panel"
+
+
+def _controls_class(approved: bool) -> str:
+    return "action-bar action-bar--approved" if approved else "action-bar action-bar--review"
+
+
+def _tab_bar_class(approved: bool, visual_count: int) -> str:
     if approved or visual_count <= 1:
-        return "visual-rail visual-rail--hidden"
-    return "visual-rail"
+        return "visual-tabs visual-tabs--hidden"
+    return "visual-tabs"
 
 
-def _focus_button_class(disabled: bool) -> str:
-    return "rail-button rail-button--disabled" if disabled else "rail-button"
+def _tab_button_class(selected: bool, hidden: bool = False) -> str:
+    if hidden:
+        return "visual-tab-button visual-tab-button--hidden"
+    if selected:
+        return "visual-tab-button visual-tab-button--selected"
+    return "visual-tab-button"
 
 
 def _dashboard_styles() -> str:
@@ -722,13 +807,13 @@ def _dashboard_styles() -> str:
             backdrop-filter: blur(18px);
         }
         .hero-panel {
-            padding: 30px;
-            margin-bottom: 22px;
+            padding: 20px 22px;
+            margin-bottom: 18px;
         }
         .hero-grid {
             display: grid;
             grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.6fr);
-            gap: 22px;
+            gap: 16px;
             align-items: start;
         }
         .eyebrow-pill {
@@ -746,27 +831,27 @@ def _dashboard_styles() -> str:
             text-transform: uppercase;
         }
         .dashboard-title {
-            margin: 18px 0 10px;
-            font-size: clamp(2.8rem, 5vw, 5rem);
-            line-height: 0.94;
+            margin: 10px 0 8px;
+            font-size: clamp(2rem, 4vw, 3.4rem);
+            line-height: 0.98;
             letter-spacing: -0.04em;
         }
         .dashboard-copy {
             margin: 0;
             max-width: 52rem;
             color: var(--text-secondary);
-            font-size: 1.04rem;
-            line-height: 1.6;
+            font-size: 0.96rem;
+            line-height: 1.5;
         }
         .signal-grid {
             display: flex;
             flex-wrap: wrap;
             gap: 12px;
-            margin-top: 24px;
+            margin-top: 16px;
         }
         .signal-chip {
-            min-width: 136px;
-            padding: 14px 16px;
+            min-width: 104px;
+            padding: 10px 12px;
             border-radius: 20px;
             background: linear-gradient(180deg, var(--surface-strong), var(--surface));
             border: 1px solid var(--border);
@@ -781,13 +866,13 @@ def _dashboard_styles() -> str:
         }
         .signal-chip-value {
             display: block;
-            margin-top: 8px;
-            font-size: 1.45rem;
+            margin-top: 4px;
+            font-size: 1.1rem;
             font-weight: 700;
             letter-spacing: -0.03em;
         }
         .theme-panel {
-            padding: 20px;
+            padding: 16px;
             border-radius: 24px;
             background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent);
             border: 1px solid var(--border);
@@ -797,9 +882,10 @@ def _dashboard_styles() -> str:
             font-size: 1rem;
         }
         .theme-panel p {
-            margin: 10px 0 0;
+            margin: 6px 0 0;
             color: var(--text-secondary);
-            line-height: 1.6;
+            line-height: 1.5;
+            font-size: 0.92rem;
         }
         .theme-toggle-row {
             display: flex;
@@ -833,8 +919,8 @@ def _dashboard_styles() -> str:
             border-color: var(--accent-primary);
         }
         .panel-card {
-            padding: 24px;
-            margin-bottom: 22px;
+            padding: 20px;
+            margin-bottom: 18px;
         }
         .section-heading {
             display: flex;
@@ -902,7 +988,10 @@ def _dashboard_styles() -> str:
             flex-wrap: wrap;
             gap: 12px;
             align-items: center;
-            margin-bottom: 18px;
+            margin-bottom: 14px;
+        }
+        .action-bar.action-bar--approved #approve-plan {
+            display: none;
         }
         .action-button {
             border: 1px solid var(--border-strong);
@@ -926,10 +1015,33 @@ def _dashboard_styles() -> str:
         }
         .filter-field {
             height: 100%;
-            padding: 18px;
+            padding: 14px;
             border-radius: 22px;
             background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), transparent);
             border: 1px solid var(--grid-border);
+        }
+        .filter-panel .section-heading p {
+            font-size: 0.92rem;
+        }
+        .filter-panel.filter-panel--compact {
+            padding: 14px 16px;
+        }
+        .filter-panel.filter-panel--compact .section-heading {
+            margin-bottom: 10px;
+        }
+        .filter-panel.filter-panel--compact .section-heading h2 {
+            font-size: 0.96rem;
+        }
+        .filter-panel.filter-panel--compact .section-heading p {
+            display: none;
+        }
+        .filter-panel.filter-panel--compact .filter-field {
+            padding: 10px 12px;
+            border-radius: 18px;
+        }
+        .filter-panel.filter-panel--compact .control-label {
+            margin-bottom: 6px;
+            font-size: 10px;
         }
         .control-label {
             display: block;
@@ -953,7 +1065,7 @@ def _dashboard_styles() -> str:
         }
         .theme-dropdown .Select-control,
         .DateRangePickerInput {
-            min-height: 52px !important;
+            min-height: 46px !important;
         }
         .theme-dropdown .Select-placeholder,
         .theme-dropdown .Select-value-label,
@@ -1013,51 +1125,41 @@ def _dashboard_styles() -> str:
         .dashboard-section {
             margin-bottom: 12px;
         }
-        .visual-rail {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 14px;
-            margin-bottom: 18px;
-            padding: 16px 18px;
-            border-radius: 22px;
-            background: linear-gradient(180deg, var(--surface-strong), var(--surface));
-            border: 1px solid var(--border);
+        .visual-tabs {
+            margin-bottom: 16px;
         }
-        .visual-rail.visual-rail--hidden {
+        .visual-tabs.visual-tabs--hidden {
             display: none;
         }
-        .visual-rail-copy {
-            min-width: 0;
-            flex: 1 1 auto;
+        .visual-tab-strip {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+            scrollbar-width: thin;
         }
-        .visual-rail-count {
-            display: block;
-            margin-bottom: 6px;
-            color: var(--accent-primary);
-            font-family: 'IBM Plex Mono', 'Consolas', monospace;
-            font-size: 11px;
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-        }
-        .visual-rail-title {
-            margin: 0;
-            font-size: 1.1rem;
-        }
-        .rail-button {
-            width: 42px;
-            height: 42px;
-            border-radius: 999px;
-            border: 1px solid var(--border-strong);
-            background: var(--surface-soft);
+        .visual-tab-button {
+            flex: 0 0 auto;
+            max-width: 220px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.02);
             color: var(--text-primary);
-            font-size: 1.4rem;
-            line-height: 1;
+            padding: 10px 14px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 0.92rem;
+            text-align: left;
             cursor: pointer;
         }
-        .rail-button.rail-button--disabled {
-            opacity: 0.42;
-            cursor: default;
+        .visual-tab-button.visual-tab-button--selected {
+            border-color: var(--border-strong);
+            background: var(--chip-bg);
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+        }
+        .visual-tab-button.visual-tab-button--hidden {
+            display: none;
         }
         .graph-grid {
             display: grid;
@@ -1067,17 +1169,12 @@ def _dashboard_styles() -> str:
         .graph-slot.graph-slot--hidden {
             display: none;
         }
-        .graph-slot.graph-slot--focus,
-        .graph-slot.graph-slot--full {
+        .graph-slot.graph-slot--focus {
             grid-column: 1 / -1;
         }
         .graph-card {
             padding: 18px 18px 10px;
             min-height: 100%;
-        }
-        .graph-card.graph-card--pinned {
-            border-color: var(--border-strong);
-            box-shadow: 0 0 0 1px rgba(80, 227, 194, 0.18), var(--shadow);
         }
         .graph-card.graph-card--hidden {
             display: none;
@@ -1132,6 +1229,18 @@ def _dashboard_styles() -> str:
             color: var(--text-secondary);
             line-height: 1.6;
             font-size: 0.95rem;
+        }
+        .workspace-grid.workspace-grid--approved .graph-slot {
+            display: block;
+        }
+        .workspace-grid.workspace-grid--approved .graph-slot.graph-slot--full {
+            grid-column: auto;
+        }
+        .workspace-grid.workspace-grid--approved .graph-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .workspace-grid.workspace-grid--approved .graph-card {
+            min-height: 100%;
         }
         .graph-copy {
             margin: 0;
@@ -1235,30 +1344,6 @@ def _dashboard_styles() -> str:
         .dashboard-shell .js-plotly-plot .plotly .modebar-btn path {
             fill: var(--text-secondary);
         }
-        .theme-tabs {
-            border: none !important;
-        }
-        .theme-tabs .tab {
-            background: transparent !important;
-        }
-        .theme-tab {
-            border: 1px solid var(--border) !important;
-            border-radius: 16px !important;
-            padding: 12px 18px !important;
-            margin-right: 10px !important;
-            color: var(--text-secondary) !important;
-            background: rgba(255, 255, 255, 0.02) !important;
-            transition: all 0.2s ease;
-        }
-        .theme-tab--selected {
-            color: var(--text-primary) !important;
-            border-color: var(--border-strong) !important;
-            background: var(--chip-bg) !important;
-            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
-        }
-        .tab-content {
-            padding-top: 18px;
-        }
         .empty-state {
             padding: 34px;
         }
@@ -1286,6 +1371,9 @@ def _dashboard_styles() -> str:
                 position: static;
             }
             .graph-grid {
+                grid-template-columns: 1fr;
+            }
+            .workspace-grid.workspace-grid--approved .graph-grid {
                 grid-template-columns: 1fr;
             }
             .hero-panel,
@@ -1474,11 +1562,12 @@ def _build_hero(design: DashboardSpec, df: pd.DataFrame, filter_count: int) -> h
     )
 
 
-def _build_filter_panel(filter_components: list[Any], filter_count: int) -> html.Section | None:
+def _build_filter_panel(filter_components: list[Any], filter_count: int, approved: bool = False) -> html.Section | None:
     if not filter_components:
         return None
     return html.Section(
-        className="panel-card",
+        id="filter-panel",
+        className=_filter_panel_class(approved),
         children=[
             html.Div(
                 className="section-heading",
@@ -1498,10 +1587,9 @@ def _build_filter_panel(filter_components: list[Any], filter_count: int) -> html
 
 
 def _graph_card_class(spec: VisualSpec, pinned_ids: list[str] | None = None) -> str:
-    pinned_ids = pinned_ids or []
     if spec.description == "__hidden_slot__":
         return "graph-card graph-card--hidden"
-    return "graph-card graph-card--pinned" if spec.id in pinned_ids or spec.pinned else "graph-card"
+    return "graph-card"
 
 
 def _placeholder_visual(index: int) -> VisualSpec:
@@ -1542,7 +1630,6 @@ def _build_graph_card(
             html.Div(
                 className="graph-actions",
                 children=[
-                    html.Button("Pin", id=f"pin-{index}", n_clicks=0, className="graph-action-button"),
                     html.Button("Regenerate", id=f"regenerate-{index}", n_clicks=0, className="graph-action-button"),
                     dcc.Input(
                         id=f"regenerate-prompt-{index}",
@@ -1613,22 +1700,20 @@ def _build_visual_section(
         className="dashboard-section",
         children=[
             html.Div(
-                id="visual-rail",
-                className=_visual_rail_class(approved, visual_count),
+                id="visual-tabs",
+                className=_tab_bar_class(approved, visual_count),
                 children=[
-                    html.Button("‹", id="focus-prev", n_clicks=0, className=_focus_button_class(safe_focus == 0)),
                     html.Div(
-                        className="visual-rail-copy",
+                        className="visual-tab-strip",
                         children=[
-                            html.Span(f"Visual {safe_focus + 1} / {visual_count}", id="visual-focus-count", className="visual-rail-count"),
-                            html.H3(focus_spec.title, id="visual-focus-title", className="visual-rail-title"),
+                            html.Button(
+                                f"{index + 1}. {spec.title}",
+                                id=f"tab-{index}",
+                                n_clicks=0,
+                                className=_tab_button_class(index == safe_focus, spec.description == "__hidden_slot__"),
+                            )
+                            for index, spec in enumerate(design.visuals)
                         ],
-                    ),
-                    html.Button(
-                        "›",
-                        id="focus-next",
-                        n_clicks=0,
-                        className=_focus_button_class(safe_focus >= visual_count - 1),
                     ),
                 ],
             ),
@@ -1659,7 +1744,12 @@ def _collect_filter_values(columns: list[tuple[str, bool]], args: tuple[Any, ...
     return values
 
 
-def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: SessionState | None = None) -> DashboardResult:
+def build_dashboard(
+    df: pd.DataFrame,
+    design: DashboardSpec,
+    session_state: SessionState | None = None,
+    llm_api_key: str | None = None,
+) -> DashboardResult:
     app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
     app.title = design.title
     app.index_string = _dashboard_index_string()
@@ -1673,9 +1763,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
     active_design = spec_versions[initial_version]
     max_visuals = max((len(spec.visuals) for spec in spec_versions), default=0)
     display_design = active_design.model_copy(update={"visuals": _visual_slots(active_design, max_visuals)})
-    initial_pins = [visual.id for visual in spec_versions[initial_version].visuals if visual.pinned]
-    initial_approval = (session_state is not None and session_state.status in {"approved", "executed", "reviewed"}) or design.approval_status != "draft"
-    initial_focus = 0
+    initial_approval = False
+    initial_tab = 0
 
     app.layout = html.Div(
         id="dashboard-root",
@@ -1684,14 +1773,13 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
             dcc.Store(id="session-state-store", data=_store_payload(session_state, design)),
             dcc.Store(id="spec-versions-store", data=_serialize_spec_versions(spec_versions)),
             dcc.Store(id="approval-store", data=initial_approval),
-            dcc.Store(id="compare-store", data=False),
-            dcc.Store(id="pinned-store", data=initial_pins),
             dcc.Store(id="version-store", data=initial_version),
-            dcc.Store(id="focus-store", data=initial_focus),
+            dcc.Store(id="tab-store", data=initial_tab),
             html.Div(
                 className="dashboard-frame",
                 children=[
                     _build_hero(active_design, df, len(filter_components)),
+                    *([_build_filter_panel(filter_components, len(filter_components), approved=initial_approval)] if filter_components else []),
                     html.Div(
                         id="workspace-grid",
                         className=_workspace_grid_class(initial_approval),
@@ -1706,15 +1794,13 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
                                         className="panel-card",
                                         children=[
                                             _build_workspace_controls(spec_versions),
-                                            *([_build_filter_panel(filter_components, len(filter_components))] if filter_components else []),
                                             _build_visual_section(
                                                 df,
                                                 display_design,
                                                 initial_theme,
                                                 approved=initial_approval,
-                                                focus_index=initial_focus,
+                                                focus_index=initial_tab,
                                                 actual_visual_count=len(active_design.visuals),
-                                                pinned_ids=initial_pins,
                                             ),
                                         ],
                                     )
@@ -1731,10 +1817,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
     inputs: list[Any] = [
         Input("theme-toggle", "value"),
         Input("version-store", "data"),
-        Input("pinned-store", "data"),
-        Input("compare-store", "data"),
         Input("approval-store", "data"),
-        Input("focus-store", "data"),
+        Input("tab-store", "data"),
         Input("spec-versions-store", "data"),
     ]
     for column, is_date_filter in filter_columns:
@@ -1744,10 +1828,11 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         else:
             inputs.append(Input(f"filter-{column}", "value"))
 
-    graph_control_inputs: list[Any] = []
+    tab_inputs: list[Any] = []
+    regenerate_inputs: list[Any] = []
     for index in range(max_visuals):
-        graph_control_inputs.append(Input(f"pin-{index}", "n_clicks"))
-        graph_control_inputs.append(Input(f"regenerate-{index}", "n_clicks"))
+        tab_inputs.append(Input(f"tab-{index}", "n_clicks"))
+        regenerate_inputs.append(Input(f"regenerate-{index}", "n_clicks"))
 
     regenerate_prompt_states = [State(f"regenerate-prompt-{index}", "value") for index in range(max_visuals)]
 
@@ -1759,10 +1844,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
 
     @app.callback(
         Output("approval-store", "data"),
-        Output("compare-store", "data"),
-        Output("pinned-store", "data"),
         Output("version-store", "data"),
-        Output("focus-store", "data"),
+        Output("tab-store", "data"),
         Output("spec-versions-store", "data"),
         Output("version-select", "value"),
         Output("version-select", "options"),
@@ -1773,20 +1856,15 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         Output("provenance-download", "data"),
         Output("trace-download", "data"),
         Input("approve-plan", "n_clicks"),
-        Input("undo-revision", "n_clicks"),
-        Input("compare-versions", "n_clicks"),
         Input("export-plan", "n_clicks"),
         Input("export-provenance", "n_clicks"),
         Input("export-trace", "n_clicks"),
         Input("version-select", "value"),
-        Input("focus-prev", "n_clicks"),
-        Input("focus-next", "n_clicks"),
-        *graph_control_inputs,
+        *tab_inputs,
+        *regenerate_inputs,
         State("approval-store", "data"),
-        State("compare-store", "data"),
-        State("pinned-store", "data"),
         State("version-store", "data"),
-        State("focus-store", "data"),
+        State("tab-store", "data"),
         State("session-state-store", "data"),
         State("spec-versions-store", "data"),
         *regenerate_prompt_states,
@@ -1794,25 +1872,19 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
     )
     def manage_workspace(
         approve_clicks,
-        undo_clicks,
-        compare_clicks,
         export_plan_clicks,
         export_provenance_clicks,
         export_clicks,
         selected_version,
-        prev_clicks,
-        next_clicks,
         *args,
     ):
-        state_offset = len(graph_control_inputs)
+        state_offset = len(tab_inputs) + len(regenerate_inputs)
         approved = bool(args[state_offset])
-        compare_mode = bool(args[state_offset + 1])
-        pinned_ids = list(args[state_offset + 2] or [])
-        version_index = int(args[state_offset + 3] or 0)
-        focus_index = int(args[state_offset + 4] or 0)
-        payload = args[state_offset + 5] or {}
-        spec_payload = args[state_offset + 6] or []
-        regenerate_prompts = list(args[state_offset + 7 :])
+        version_index = int(args[state_offset + 1] or 0)
+        tab_index = int(args[state_offset + 2] or 0)
+        payload = args[state_offset + 3] or {}
+        spec_payload = args[state_offset + 4] or []
+        regenerate_prompts = list(args[state_offset + 5 :])
         current_versions = _deserialize_spec_versions(spec_payload, spec_versions)
         triggered = ctx.triggered_id
         plan_download = no_update
@@ -1825,7 +1897,7 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         if not current_versions:
             current_versions = spec_versions
         version_index = min(max(version_index, 0), len(current_versions) - 1)
-        focus_index = min(max(focus_index, 0), max(len(current_versions[version_index].visuals) - 1, 0))
+        tab_index = min(max(tab_index, 0), max(len(current_versions[version_index].visuals) - 1, 0))
 
         if triggered == "approve-plan":
             approved = True
@@ -1838,18 +1910,10 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
             ]
             current_versions.append(approved_spec)
             version_index = len(current_versions) - 1
-            focus_index = 0
+            tab_index = 0
             status = "Plan status: dashboard canvas approved"
-            action_status = "Approved plan and expanded the dashboard canvas"
+            action_status = "Approved plan and switched to the dashboard canvas"
             approve_label = "Plan Approved"
-        elif triggered == "undo-revision":
-            version_index = max(version_index - 1, 0)
-            focus_index = min(focus_index, max(len(current_versions[version_index].visuals) - 1, 0))
-            status = f"Plan status: reverted to version {version_index + 1}"
-            action_status = f"Viewing Version {version_index + 1}"
-        elif triggered == "compare-versions":
-            compare_mode = not compare_mode
-            action_status = "Version comparison enabled" if compare_mode else "Version comparison hidden"
         elif triggered == "export-plan":
             filename = f"{payload.get('session_id', 'session')}_navigator_plan_v{version_index + 1}.md"
             plan_download = {
@@ -1860,7 +1924,7 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         elif triggered == "export-provenance":
             filename = f"{payload.get('session_id', 'session')}_provenance_v{version_index + 1}.md"
             provenance_download = {
-                "content": _provenance_export_markdown(payload, current_versions, version_index, compare_mode),
+                "content": _provenance_export_markdown(payload, current_versions, version_index, False),
                 "filename": filename,
             }
             action_status = "Provenance drawer export prepared"
@@ -1875,36 +1939,27 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         elif triggered == "version-select":
             version_index = int(selected_version or 0)
             version_index = min(max(version_index, 0), len(current_versions) - 1)
-            focus_index = min(focus_index, max(len(current_versions[version_index].visuals) - 1, 0))
+            tab_index = min(tab_index, max(len(current_versions[version_index].visuals) - 1, 0))
             action_status = f"Viewing Version {version_index + 1}"
-        elif triggered == "focus-prev":
-            focus_index = max(focus_index - 1, 0)
-            action_status = f"Focused chart {focus_index + 1}"
-        elif triggered == "focus-next":
-            active_visual_count = len(current_versions[version_index].visuals)
-            focus_index = min(focus_index + 1, max(active_visual_count - 1, 0))
-            action_status = f"Focused chart {focus_index + 1}"
-        elif isinstance(triggered, str) and triggered.startswith("pin-"):
+        elif isinstance(triggered, str) and triggered.startswith("tab-"):
             graph_index = int(triggered.split("-", maxsplit=1)[1])
             active_spec = current_versions[version_index]
             if graph_index < len(active_spec.visuals):
-                visual_id = active_spec.visuals[graph_index].id
-                if visual_id in pinned_ids:
-                    pinned_ids = [item for item in pinned_ids if item != visual_id]
-                    action_status = f"Unpinned {active_spec.visuals[graph_index].title}"
-                else:
-                    pinned_ids.append(visual_id)
-                    action_status = f"Pinned {active_spec.visuals[graph_index].title}"
+                tab_index = graph_index
+                action_status = f"Viewing {active_spec.visuals[graph_index].title}"
         elif isinstance(triggered, str) and triggered.startswith("regenerate-"):
             graph_index = int(triggered.split("-", maxsplit=1)[1])
             active_spec = current_versions[version_index].model_copy(deep=True)
             if graph_index < len(active_spec.visuals):
                 prompt = (regenerate_prompts[graph_index] or "").strip()
-                active_spec.visuals[graph_index] = _regenerate_visual_spec(df, active_spec.visuals[graph_index], prompt)
+                regenerated = _llm_regenerate_visual_spec(df, active_spec.visuals[graph_index], prompt, llm_api_key)
+                if regenerated is None:
+                    regenerated = _regenerate_visual_spec(df, active_spec.visuals[graph_index], prompt)
+                active_spec.visuals[graph_index] = regenerated
                 active_spec.approval_status = "approved" if approved else "draft"
                 current_versions.append(active_spec)
                 version_index = len(current_versions) - 1
-                focus_index = graph_index
+                tab_index = graph_index
                 action_status = (
                     f"Regenerated {active_spec.visuals[graph_index].title} around '{prompt}'"
                     if prompt
@@ -1914,10 +1969,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         version_options = _version_options(current_versions)
         return (
             approved,
-            compare_mode,
-            pinned_ids,
             version_index,
-            focus_index,
+            tab_index,
             _serialize_spec_versions(current_versions),
             version_index,
             version_options,
@@ -1939,27 +1992,23 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
             + [Output(f"graph-caption-{index}", "children") for index in range(max_visuals)]
             + [Output(f"graph-kind-{index}", "children") for index in range(max_visuals)]
             + [Output(f"graph-rationale-{index}", "children") for index in range(max_visuals)]
-            + [Output(f"pin-{index}", "children") for index in range(max_visuals)]
+            + [Output(f"tab-{index}", "className") for index in range(max_visuals)]
             + [Output("version-summary", "children")]
             + [Output("workspace-grid", "className")]
             + [Output("workspace-main", "className")]
             + [Output("plan-panel", "className")]
             + [Output("provenance-panel", "className")]
-            + [Output("visual-rail", "className")]
-            + [Output("visual-focus-count", "children")]
-            + [Output("visual-focus-title", "children")]
-            + [Output("focus-prev", "className")]
-            + [Output("focus-next", "className")]
+            + [Output("filter-panel", "className")]
+            + [Output("workspace-controls", "className")]
+            + [Output("visual-tabs", "className")]
             + shell_outputs,
             inputs,
         )
         def update_dashboard(
             is_dark: bool,
             version_index: int,
-            pinned_ids: list[str],
-            compare_mode: bool,
             approved: bool,
-            focus_index: int,
+            tab_index: int,
             spec_payload: list[dict[str, Any]],
             *filter_args,
         ):
@@ -1969,7 +2018,7 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
             active_spec = live_versions[safe_version]
             visible_visuals = _visual_slots(active_spec, max_visuals)
             visual_count = len(active_spec.visuals)
-            safe_focus = min(max(int(focus_index or 0), 0), max(visual_count - 1, 0))
+            safe_tab = min(max(int(tab_index or 0), 0), max(visual_count - 1, 0))
             values = _collect_filter_values(filter_columns, filter_args)
             filtered = _apply_filters(df, active_spec.filters, values)
             figures = [_render_visual(filtered, spec, theme) for spec in visible_visuals]
@@ -1979,11 +2028,11 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
                     slot_classes.append("graph-slot graph-slot--hidden")
                 elif approved:
                     slot_classes.append("graph-slot graph-slot--full")
-                elif index == safe_focus:
+                elif index == safe_tab:
                     slot_classes.append("graph-slot graph-slot--focus")
                 else:
                     slot_classes.append("graph-slot graph-slot--hidden")
-            card_classes = [_graph_card_class(spec, pinned_ids) for spec in visible_visuals]
+            card_classes = [_graph_card_class(spec, None) for spec in visible_visuals]
             titles = [spec.title for spec in visible_visuals]
             captions = [_visual_caption(spec) for spec in visible_visuals]
             kinds = [spec.chart_type for spec in visible_visuals]
@@ -1991,19 +2040,14 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
                 spec.rationale or "Navigator rationale will appear here once the plan is available."
                 for spec in visible_visuals
             ]
-            pin_labels = [
-                "Unpin" if spec.id in (pinned_ids or []) or spec.pinned else "Pin"
-                for spec in visible_visuals
+            tab_classes = [
+                _tab_button_class(index == safe_tab, spec.description == "__hidden_slot__")
+                for index, spec in enumerate(visible_visuals)
             ]
             version_summary = html.Ul(
-                [html.Li(item) for item in _version_summary(live_versions, safe_version, bool(compare_mode))],
+                [html.Li(item) for item in _version_summary(live_versions, safe_version, False)],
                 className="sidebar-list",
             )
-            rail_class = _visual_rail_class(bool(approved), visual_count)
-            focus_title = active_spec.visuals[safe_focus].title if visual_count else "No visuals"
-            focus_count = f"Visual {safe_focus + 1} / {visual_count}" if visual_count else "Visual 0 / 0"
-            prev_class = _focus_button_class(safe_focus == 0 or visual_count <= 1)
-            next_class = _focus_button_class(safe_focus >= visual_count - 1 or visual_count <= 1)
             return (
                 figures
                 + slot_classes
@@ -2012,18 +2056,16 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
                 + captions
                 + kinds
                 + rationales
-                + pin_labels
+                + tab_classes
                 + [
                     version_summary,
                     _workspace_grid_class(bool(approved)),
                     _workspace_main_class(bool(approved)),
                     _sidebar_panel_class("panel-card", bool(approved)),
                     _sidebar_panel_class("panel-card provenance-card", bool(approved)),
-                    rail_class,
-                    focus_count,
-                    focus_title,
-                    prev_class,
-                    next_class,
+                    _filter_panel_class(bool(approved)),
+                    _controls_class(bool(approved)),
+                    _tab_bar_class(bool(approved), visual_count),
                     _root_class(theme),
                     _theme_status(theme),
                     _theme_badge(theme),
@@ -2039,6 +2081,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
                 Output("workspace-main", "className"),
                 Output("plan-panel", "className"),
                 Output("provenance-panel", "className"),
+                Output("filter-panel", "className"),
+                Output("workspace-controls", "className"),
             ]
             + shell_outputs,
             inputs,
@@ -2046,10 +2090,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
         def update_dashboard_shell(
             is_dark: bool,
             version_index: int,
-            _pinned_ids,
-            compare_mode: bool,
             approved: bool,
-            _focus_index,
+            _tab_index,
             spec_payload: list[dict[str, Any]],
             *_filter_args,
         ):
@@ -2057,7 +2099,7 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
             live_versions = _deserialize_spec_versions(spec_payload, spec_versions)
             safe_version = min(max(int(version_index or 0), 0), len(live_versions) - 1)
             version_summary = html.Ul(
-                [html.Li(item) for item in _version_summary(live_versions, safe_version, bool(compare_mode))],
+                [html.Li(item) for item in _version_summary(live_versions, safe_version, False)],
                 className="sidebar-list",
             )
             return (
@@ -2066,6 +2108,8 @@ def build_dashboard(df: pd.DataFrame, design: DashboardSpec, session_state: Sess
                 _workspace_main_class(bool(approved)),
                 _sidebar_panel_class("panel-card", bool(approved)),
                 _sidebar_panel_class("panel-card provenance-card", bool(approved)),
+                _filter_panel_class(bool(approved)),
+                _controls_class(bool(approved)),
                 _root_class(theme),
                 _theme_status(theme),
                 _theme_badge(theme),

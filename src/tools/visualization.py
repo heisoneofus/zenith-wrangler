@@ -168,6 +168,20 @@ def _infer_bar_axes(df: pd.DataFrame, spec: VisualSpec) -> VisualSpec:
     return spec.model_copy(update={"x": inferred_x, "y": inferred_y})
 
 
+def _infer_pie_fields(df: pd.DataFrame, spec: VisualSpec) -> VisualSpec:
+    if spec.chart_type != "pie":
+        return spec
+    if spec.x is not None:
+        return spec
+
+    inferred_x = spec.color
+    inferred_y = spec.y
+    if inferred_x is None:
+        categorical_columns = [column for column in df.columns if not pd.api.types.is_numeric_dtype(df[column])]
+        inferred_x = next((column for column in categorical_columns if column != inferred_y), None)
+    return spec.model_copy(update={"x": inferred_x})
+
+
 def _required_fields(spec: VisualSpec) -> set[str]:
     if spec.chart_type in {"line", "scatter", "box", "area"}:
         return {"x", "y"}
@@ -216,6 +230,11 @@ def _validate_spec(df: pd.DataFrame, spec: VisualSpec) -> None:
     elif "x_or_y" in required:
         histogram_axis = spec.x or spec.y
         _require_column(df, histogram_axis, "x or y", spec.chart_type)
+    elif spec.chart_type == "pie":
+        pie_names = spec.x or spec.color
+        _require_column(df, pie_names, "x or color", spec.chart_type)
+        if spec.y is not None:
+            _require_column(df, spec.y, "y", spec.chart_type)
     elif spec.chart_type == "heatmap":
         if spec.x and spec.x not in df.columns:
             raise ValueError(f"Column '{spec.x}' required for heatmap chart is missing from dataset.")
@@ -228,6 +247,12 @@ def _validate_spec(df: pd.DataFrame, spec: VisualSpec) -> None:
                 raise ValueError("Histogram aggregation requires either 'x' or 'y' field.")
             if spec.aggregation != "count" and spec.y is None:
                 raise ValueError("Histogram aggregation requires 'y' field unless aggregation is 'count'.")
+        elif spec.chart_type == "pie":
+            pie_names = spec.x or spec.color
+            if not pie_names:
+                raise ValueError("Pie chart aggregation requires a category field in 'x' or 'color'.")
+            if spec.aggregation != "count" and spec.y is None:
+                raise ValueError("Pie chart aggregation requires 'y' field unless aggregation is 'count'.")
         elif not (spec.x and spec.y):
             raise ValueError("Aggregation requires both 'x' and 'y' fields.")
 
@@ -276,18 +301,49 @@ def _build_heatmap_data(df: pd.DataFrame, spec: VisualSpec, theme: DashboardThem
     return apply_figure_theme(figure, theme=theme)
 
 
+def _apply_time_grain(df: pd.DataFrame, spec: VisualSpec) -> tuple[pd.DataFrame, VisualSpec]:
+    if not spec.time_grain or not spec.x or spec.x not in df.columns:
+        return df, spec
+
+    series = pd.to_datetime(df[spec.x], errors="coerce", format="mixed")
+    if series.notna().sum() == 0:
+        return df, spec
+
+    bucket_column = f"__bucket_{spec.time_grain}_{spec.x}"
+    bucketed = df.copy()
+    if spec.time_grain == "day":
+        bucketed[bucket_column] = series.dt.floor("D")
+    elif spec.time_grain == "week":
+        bucketed[bucket_column] = series.dt.to_period("W").dt.start_time
+    else:
+        bucketed[bucket_column] = series.dt.to_period("M").dt.start_time
+    return bucketed, spec.model_copy(update={"x": bucket_column})
+
+
 def create_figure(df: pd.DataFrame, spec: VisualSpec, theme: DashboardTheme | str = "light"):
     if df.empty:
         return error_figure(spec.title, "No data available to visualize.", theme=theme)
 
     spec = _infer_bar_axes(df, spec)
+    spec = _infer_pie_fields(df, spec)
     spec, warnings = _sanitize_optional_encodings(df, spec)
     for warning in warnings:
         logger.warning(warning)
+    df, spec = _apply_time_grain(df, spec)
     _validate_spec(df, spec)
     data = df
 
-    if spec.aggregation and spec.x and spec.y and spec.chart_type != "heatmap":
+    if spec.chart_type == "pie" and spec.aggregation:
+        pie_names = spec.x or spec.color
+        if spec.aggregation == "count":
+            data = df.groupby(pie_names, dropna=False).size().reset_index(name="__count__")
+            pie_values = "__count__"
+        else:
+            data = df.groupby(pie_names, dropna=False)[spec.y].agg(spec.aggregation).reset_index()
+            pie_values = spec.y
+        if data.empty:
+            return error_figure(spec.title, "Aggregation resulted in empty dataset.", theme=theme)
+    elif spec.aggregation and spec.x and spec.y and spec.chart_type != "heatmap":
         group_keys = [spec.x]
         optional_grouping_columns = [
             column for column in _optional_encodings(spec).values() if column in df.columns
@@ -325,7 +381,17 @@ def create_figure(df: pd.DataFrame, spec: VisualSpec, theme: DashboardTheme | st
         figure = px.area(data, x=spec.x, y=spec.y, color=spec.color, title=spec.title)
         return apply_figure_theme(figure, theme=theme)
     if chart == "pie":
-        figure = px.pie(data, names=spec.x, values=spec.y, color=spec.color, title=spec.title)
+        pie_names = spec.x or spec.color
+        pie_values = None
+        pie_color = spec.color
+        if spec.aggregation == "count":
+            pie_values = "__count__"
+            pie_color = pie_names
+        elif spec.aggregation:
+            pie_values = spec.y
+        else:
+            pie_values = spec.y
+        figure = px.pie(data, names=pie_names, values=pie_values, color=pie_color, title=spec.title)
         return apply_figure_theme(figure, theme=theme)
     figure = px.bar(data, x=spec.x, y=spec.y, color=spec.color, title=spec.title)
     return apply_figure_theme(figure, theme=theme)

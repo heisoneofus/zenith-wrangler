@@ -43,6 +43,7 @@ class VisualSpec(BaseModel):
     x: str | None = None
     y: str | None = None
     color: str | None = None
+    time_grain: Literal["day", "week", "month"] | None = None
     aggregation: Literal["sum", "mean", "median", "count"] | None = None
     description: str | None = None
     source_dataframe_ref: str | None = None

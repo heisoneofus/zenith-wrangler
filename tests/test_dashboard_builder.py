@@ -76,6 +76,9 @@ def test_build_dashboard_sets_initial_figures_without_filters() -> None:
     assert "dashboard-graph" in str(dashboard.app.layout)
     assert "Export Provenance" in str(dashboard.app.layout)
     assert "Tell Navigator what this regeneration should focus on" in str(dashboard.app.layout)
+    assert "Undo Revision" not in str(dashboard.app.layout)
+    assert "Compare Versions" not in str(dashboard.app.layout)
+    assert ">Pin<" not in str(dashboard.app.layout)
 
 
 def test_regenerate_visual_spec_uses_prompt_to_reframe_chart() -> None:

@@ -130,11 +130,17 @@ def _render_reviewed_dashboard(
     output_format: str,
     output_path: Path,
     port: int,
+    llm_api_key: str | None = None,
 ):
     from src.dashboard.builder import build_dashboard
 
     figures = [create_figure(df, spec, theme=session_state.active_spec.theme) for spec in session_state.active_spec.visuals]
-    dashboard = build_dashboard(df, session_state.active_spec, session_state=session_state)
+    dashboard = build_dashboard(
+        df,
+        session_state.active_spec,
+        session_state=session_state,
+        llm_api_key=llm_api_key,
+    )
     rendered_output = export_dashboard(
         output_format=output_format,
         output_path=output_path,
@@ -270,6 +276,7 @@ def main(
                     output_format=output_format,
                     output_path=output_path,
                     port=port,
+                    llm_api_key=config.llm.api_key,
                 )
             else:
                 rendered_output = None
@@ -372,6 +379,7 @@ def main(
                 output_format=output_format,
                 output_path=output_path,
                 port=port,
+                llm_api_key=config.llm.api_key,
             )
         except Exception as exc:
             session_state.status = "failed"
