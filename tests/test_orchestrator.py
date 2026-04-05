@@ -324,6 +324,28 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(derived_chart_x, {20, 30})
         self.assertIn("aggregate_by", result.transformations_applied)
 
+    def test_create_figure_tool_returns_error_figure_for_invalid_visual_spec(self) -> None:
+        registry = build_registry()
+        tool = registry.get("create_figure")
+        context = {
+            "dataframe": pd.DataFrame({"region": ["EU", "US"], "sales": [10, 20]}),
+            "dataframes": {"baseline": pd.DataFrame({"region": ["EU", "US"], "sales": [10, 20]})},
+            "baseline_dataframe_ref": "baseline",
+        }
+
+        figure = tool.execute(
+            context,
+            spec={
+                "title": "Broken Heatmap",
+                "chart_type": "heatmap",
+                "x": "region",
+                "color": "sales",
+                "aggregation": "mean",
+            },
+        )
+
+        self.assertIn("Unable to render chart", str(figure.layout.annotations[0]["text"]))
+
     def test_execute_plan_allows_sequential_reshape_operations_from_baseline(self) -> None:
         registry = build_registry()
         dataset = pd.DataFrame(

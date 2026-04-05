@@ -104,6 +104,15 @@ def _next_derived_dataframe_ref(context: dict[str, Any], tool_name: str) -> str:
     return _sanitize_dataframe_ref(f"{tool_name}_{counter}", f"derived_{counter}")
 
 
+def _safe_create_figure(context: dict[str, Any], spec: VisualSpec | dict[str, Any], dataframe_ref: str | None = None):
+    dataframe = _resolve_context_dataframe(context, dataframe_ref=dataframe_ref, default_to_baseline=True)
+    visual_spec = spec if isinstance(spec, VisualSpec) else VisualSpec.model_validate(spec)
+    try:
+        return visualization.create_figure(dataframe, visual_spec)
+    except Exception as exc:
+        return visualization.error_figure(visual_spec.title, f"Unable to render chart: {exc}")
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
@@ -803,9 +812,10 @@ def build_registry() -> ToolRegistry:
                     "spec": {"title": "Sales by Region", "chart_type": "bar", "x": "region", "y": "sales"},
                 },
             ],
-            execute=lambda ctx, spec, dataframe_ref=None: visualization.create_figure(
-                _resolve_context_dataframe(ctx, dataframe_ref=dataframe_ref, default_to_baseline=True),
-                spec if isinstance(spec, VisualSpec) else VisualSpec.model_validate(spec),
+            execute=lambda ctx, spec, dataframe_ref=None: _safe_create_figure(
+                ctx,
+                spec,
+                dataframe_ref=dataframe_ref,
             ),
         )
     )

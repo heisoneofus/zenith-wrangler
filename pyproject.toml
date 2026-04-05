@@ -7,6 +7,7 @@ dependencies = [
   "click>=8.1",
   "dash>=2.17",
   "dash-bootstrap-components>=1.6",
+  "fastapi>=0.116",
   "loguru>=0.7",
   "openai>=1.40",
   "openpyxl>=3.1",
@@ -16,7 +17,9 @@ dependencies = [
   "pyarrow>=16.0",
   "pydantic>=2.7",
   "polars>=0.20",
+  "python-multipart>=0.0.20",
   "pyyaml>=6.0",
+  "uvicorn>=0.35",
 ]
 
 [project.optional-dependencies]
